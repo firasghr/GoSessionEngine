@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"sync"
 	"time"
 )
 
@@ -55,10 +54,6 @@ type Config struct {
 	MaxConnsPerHost int `json:"max_conns_per_host"`
 }
 
-// mu guards the singleton default config so DefaultConfig() is safe to call
-// from multiple goroutines simultaneously.
-var mu sync.Mutex
-
 // LoadConfig reads a JSON file at filename and deserialises it into a Config.
 // It returns an error if the file cannot be opened or if the JSON is malformed.
 // The returned *Config is ready to use; zero-value fields retain Go's zero
@@ -85,9 +80,6 @@ func LoadConfig(filename string) (*Config, error) {
 // Callers are free to mutate the returned struct before passing it to other
 // components; each call returns a fresh independent copy.
 func DefaultConfig() *Config {
-	mu.Lock()
-	defer mu.Unlock()
-
 	return &Config{
 		NumberOfSessions:    500,
 		RequestTimeout:      30 * time.Second,

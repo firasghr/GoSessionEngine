@@ -12,10 +12,10 @@ import (
 // Design choices:
 //   - workerCount goroutines are started once and reused, avoiding the cost of
 //     spawning a goroutine per job.
-//   - jobQueue is an unbuffered channel: Submit blocks until a worker picks up
-//     the job, providing natural back-pressure that prevents unbounded memory
-//     growth when producers outrun consumers.  If callers prefer non-blocking
-//     submission, they can wrap Submit in their own goroutine.
+//   - jobQueue is a buffered channel (capacity workerCount*4): workers can pick
+//     up the next job immediately after finishing the current one, reducing
+//     context switches at high throughput.  Submit blocks only when the buffer
+//     is full, applying natural back-pressure to producers.
 //   - Stop closes the channel and waits (via wg) for every in-flight job to
 //     finish before returning, preventing goroutine leaks.
 type WorkerPool struct {
