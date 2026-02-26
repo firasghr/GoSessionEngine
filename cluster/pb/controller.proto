@@ -1,0 +1,116 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "github.com/firasghr/GoSessionEngine/cluster/pb";
+
+// ─── Messages ────────────────────────────────────────────────────────────────
+
+// Cookie represents a single HTTP cookie that a worker has obtained after
+// solving a JS/bot-detection challenge.
+message Cookie {
+  string name        = 1;
+  string value       = 2;
+  string domain      = 3;
+  string path        = 4;
+  // Unix timestamp (seconds).  Zero means session cookie (no explicit expiry).
+  int64  expires_unix = 5;
+  bool   secure      = 6;
+  bool   http_only   = 7;
+}
+
+// SessionStatus describes the current lifecycle state of one session.
+message SessionStatus {
+  // Globally unique session identifier (0-1999 for a 2 000-session cluster).
+  int32  session_id = 1;
+  // Identifier of the PC / node that owns this session, e.g. "pc-1".
+  string pc_id      = 2;
+  // Lifecycle state: "idle" | "active" | "challenge" | "closed".
+  string state      = 3;
+  // Last-known cookie value for this session (empty when not authenticated).
+  string cookie_value = 4;
+}
+
+// BroadcastCookieRequest is sent by the worker that solved a challenge.
+// The master stores the cookies in the Global Cookie Jar and fans them out
+// to every subscribed worker via the WatchCookies stream.
+message BroadcastCookieRequest {
+  string          pc_id      = 1;
+  int32           session_id = 2;
+  repeated Cookie cookies    = 3;
+}
+
+message BroadcastCookieResponse {
+  // true when the master accepted and stored the cookies.
+  bool accepted = 1;
+}
+
+// UpdateStatusRequest lets a worker report a session's current state.
+message UpdateStatusRequest {
+  SessionStatus status = 1;
+}
+
+message UpdateStatusResponse {
+  bool ok = 1;
+}
+
+// GetGlobalCookiesRequest asks the master for a snapshot of the Global Cookie
+// Jar.
+message GetGlobalCookiesRequest {
+  string pc_id = 1;
+}
+
+// GetGlobalCookiesResponse carries the current cookie jar snapshot.
+// It is also used as the payload pushed over the WatchCookies stream.
+message GetGlobalCookiesResponse {
+  repeated Cookie    cookies  = 1;
+  // Monotonically increasing version so workers can detect stale snapshots.
+  int64              version  = 2;
+}
+
+// WatchCookiesRequest subscribes the caller to cookie-update events.
+message WatchCookiesRequest {
+  string pc_id = 1;
+}
+
+// GetAllStatusRequest asks for a full snapshot of every tracked session.
+message GetAllStatusRequest {}
+
+message GetAllStatusResponse {
+  repeated SessionStatus sessions = 1;
+}
+
+// ─── Service ─────────────────────────────────────────────────────────────────
+
+// MasterController is the central coordinator for a 6-PC, 2 000-session
+// GoSessionEngine cluster.
+//
+// Responsibilities:
+//  1. Maintain a Global Cookie Jar: when any worker solves a JS/bot challenge
+//     it calls BroadcastCookie; the master persists the cookies and fans them
+//     out to all active WatchCookies subscribers so other workers can begin
+//     making authenticated requests immediately.
+//  2. Track session states: workers call UpdateStatus whenever a session
+//     transitions between lifecycle states.  GetAllStatus lets operators
+//     and monitoring tools inspect the entire cluster in one RPC.
+service MasterController {
+  // BroadcastCookie is called by a worker that has obtained valid session
+  // cookies (e.g. after solving a Cloudflare / Akamai JS challenge).
+  // The master stores the cookies and pushes them to all WatchCookies
+  // subscribers.
+  rpc BroadcastCookie(BroadcastCookieRequest) returns (BroadcastCookieResponse);
+
+  // UpdateStatus reports the current lifecycle state of a single session.
+  rpc UpdateStatus(UpdateStatusRequest) returns (UpdateStatusResponse);
+
+  // GetGlobalCookies returns a snapshot of the current Global Cookie Jar.
+  rpc GetGlobalCookies(GetGlobalCookiesRequest) returns (GetGlobalCookiesResponse);
+
+  // WatchCookies opens a server-streaming RPC.  The master pushes a new
+  // GetGlobalCookiesResponse every time BroadcastCookie adds fresh cookies,
+  // so subscribers receive updates with minimal latency.
+  rpc WatchCookies(WatchCookiesRequest) returns (stream GetGlobalCookiesResponse);
+
+  // GetAllStatus returns a snapshot of every tracked session across all PCs.
+  rpc GetAllStatus(GetAllStatusRequest) returns (GetAllStatusResponse);
+}

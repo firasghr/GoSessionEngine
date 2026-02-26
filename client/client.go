@@ -8,6 +8,8 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 // transportDefaults groups transport-layer knobs that are set once at
@@ -26,6 +28,59 @@ var defaultTransport = transportDefaults{
 	maxIdleConns:        500,
 	maxIdleConnsPerHost: 100,
 	maxConnsPerHost:     200,
+}
+
+// NewHTTPClientWithTLS constructs a *http.Client whose every TLS connection
+// uses the uTLS library to impersonate the browser fingerprint described by
+// helloID, bypassing JA3/JA4 fingerprint detection.
+//
+// The returned client shares the same transport-pool tuning as NewHTTPClient
+// but wraps the *http.Transport's DialTLSContext with a UTLSDialer so that
+// every outgoing TLS handshake produces a ClientHello matching a real Chrome
+// browser (when helloID is utls.HelloChrome_120 or utls.HelloChrome_131).
+//
+// Use NewHTTPClient when TLS fingerprint bypass is not required.
+func NewHTTPClientWithTLS(proxyStr string, timeout time.Duration, helloID utls.ClientHelloID) (*http.Client, error) {
+	transport, err := buildTransportWithTLS(proxyStr, helloID)
+	if err != nil {
+		return nil, err
+	}
+
+	jar, err := newCookieJar()
+	if err != nil {
+		return nil, fmt.Errorf("client: create cookie jar: %w", err)
+	}
+
+	return &http.Client{
+		Transport: transport,
+		Jar:       jar,
+		Timeout:   timeout,
+	}, nil
+}
+
+// buildTransportWithTLS creates an *http.Transport with the uTLS dialer wired
+// in for JA3/JA4 bypass.
+func buildTransportWithTLS(proxyStr string, helloID utls.ClientHelloID) (*http.Transport, error) {
+	t := &http.Transport{
+		DisableKeepAlives:     false,
+		MaxIdleConns:          defaultTransport.maxIdleConns,
+		MaxIdleConnsPerHost:   defaultTransport.maxIdleConnsPerHost,
+		MaxConnsPerHost:       defaultTransport.maxConnsPerHost,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	if proxyStr != "" {
+		proxyURL, err := url.Parse(proxyStr)
+		if err != nil {
+			return nil, fmt.Errorf("client: parse proxy URL %q: %w", proxyStr, err)
+		}
+		t.Proxy = http.ProxyURL(proxyURL)
+	}
+
+	t.DialTLSContext = UTLSDialerHTTP1(helloID)
+	return t, nil
 }
 
 // NewHTTPClient constructs a *http.Client that is safe for concurrent use.

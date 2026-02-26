@@ -70,7 +70,8 @@ func UTLSDialer(helloID utls.ClientHelloID) func(ctx context.Context, network, a
 		// GREASE values are randomised, cipher-suite order is set, and all
 		// extensions (SNI, supported-groups, key-share, ALPN, …) are
 		// configured to match the real browser.
-		if err := uConn.ApplyPreset(buildClientHelloSpec(helloID)); err != nil {
+		spec := buildClientHelloSpec(helloID)
+		if err := uConn.ApplyPreset(&spec); err != nil {
 			_ = rawConn.Close()
 			return nil, fmt.Errorf("utls dialer: apply preset for %s: %w", helloID.Str(), err)
 		}
@@ -82,6 +83,18 @@ func UTLSDialer(helloID utls.ClientHelloID) func(ctx context.Context, network, a
 		}
 
 		return uConn, nil
+	}
+}
+
+// UTLSDialerHTTP1 is identical to UTLSDialer but returns a function whose
+// signature matches http.Transport.DialTLSContext, which does not receive a
+// *tls.Config argument (the SNI is derived solely from the addr parameter).
+// Use this when wiring uTLS into an http.Transport; use UTLSDialer for
+// golang.org/x/net/http2.Transport.
+func UTLSDialerHTTP1(helloID utls.ClientHelloID) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	inner := UTLSDialer(helloID)
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return inner(ctx, network, addr, nil)
 	}
 }
 
