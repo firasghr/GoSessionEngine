@@ -137,3 +137,56 @@ func TestSolverImplementsInterface(t *testing.T) {
 	// Compile-time check that *OttoSolver implements Solver.
 	var _ jschallenge.Solver = s
 }
+
+// TestAkamaiStyleScript injects a mock Akamai-style challenge script that
+//
+//  1. Accesses window.navigator.userAgent (must not throw ReferenceError).
+//  2. Reads document.cookie (must not throw ReferenceError).
+//  3. Performs an integer math operation.
+//  4. Seeds document.cookie with the computed result.
+//
+// The test asserts that GetCookie returns the expected cookie string,
+// confirming that the Go solver handles all Akamai DOM globals and produces
+// the correct side-effect without any JavaScript errors.
+func TestAkamaiStyleScript(t *testing.T) {
+	const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+	s, err := jschallenge.NewOttoSolver(ua)
+	if err != nil {
+		t.Fatalf("NewOttoSolver: %v", err)
+	}
+
+	// Mock Akamai _abck seeding script.
+	//  - window.navigator.userAgent is read and must equal the injected UA.
+	//  - document.cookie is read (initially "") without error.
+	//  - A math expression derives the token value.
+	//  - document.cookie is set to the computed _abck value.
+	script := `
+		var ua      = window.navigator.userAgent;
+		var initial = document.cookie;
+		var token   = Math.floor(3.7) * 2 + 1;
+		document.cookie = "_abck=" + token + "; path=/";
+	`
+	if _, err := s.Eval(script); err != nil {
+		t.Fatalf("Eval Akamai-style script: %v", err)
+	}
+
+	// Verify navigator.userAgent was readable inside the script.
+	gotUA, err := s.Eval("window.navigator.userAgent")
+	if err != nil {
+		t.Fatalf("Eval window.navigator.userAgent: %v", err)
+	}
+	if gotUA != ua {
+		t.Errorf("window.navigator.userAgent: got %q, want %q", gotUA, ua)
+	}
+
+	// Math.floor(3.7) = 3, token = 3*2+1 = 7
+	const wantCookie = "_abck=7; path=/"
+	got, err := s.GetCookie()
+	if err != nil {
+		t.Fatalf("GetCookie: %v", err)
+	}
+	if got != wantCookie {
+		t.Errorf("document.cookie: got %q, want %q", got, wantCookie)
+	}
+}

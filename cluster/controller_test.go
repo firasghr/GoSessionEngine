@@ -4,11 +4,13 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/test/bufconn"
 
 	pb "github.com/firasghr/GoSessionEngine/cluster/pb"
 	"github.com/firasghr/GoSessionEngine/cluster"
@@ -364,4 +366,130 @@ func TestWorkerClient_WatchCookies(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("did not receive broadcast push within 2s")
 	}
+}
+
+// ─── bufconn in-memory integration test ──────────────────────────────────────
+
+// startBufconnServer starts a MasterControllerServer on an in-memory bufconn
+// listener (no OS port allocation) and returns a dial function for connecting
+// clients and a cleanup function.
+func startBufconnServer(t *testing.T) (dialFunc func(context.Context, string) (net.Conn, error), stop func()) {
+	t.Helper()
+	const bufSize = 1 << 20 // 1 MiB
+	lis := bufconn.Listen(bufSize)
+
+	grpcSrv := grpc.NewServer()
+	pb.RegisterMasterControllerServer(grpcSrv, cluster.NewMasterControllerServer())
+	go func() { _ = grpcSrv.Serve(lis) }()
+
+	dialFn := func(ctx context.Context, _ string) (net.Conn, error) {
+		return lis.DialContext(ctx)
+	}
+	stopFn := func() {
+		grpcSrv.GracefulStop()
+		_ = lis.Close()
+	}
+	return dialFn, stopFn
+}
+
+// dialBufconn creates a gRPC client connection through the in-memory bufconn.
+func dialBufconn(t *testing.T, dialFn func(context.Context, string) (net.Conn, error)) pb.MasterControllerClient {
+	t.Helper()
+	conn, err := grpc.NewClient(
+		"passthrough:///bufconn",
+		grpc.WithContextDialer(dialFn),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("dialBufconn: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return pb.NewMasterControllerClient(conn)
+}
+
+// TestWatchCookies_BufconnBroadcast is an in-memory integration test for the
+// Master-Worker gRPC setup.  It uses bufconn to avoid real network port
+// collisions.  The test:
+//
+//  1. Starts the MasterControllerServer on an in-memory bufconn listener.
+//  2. Connects two mock WorkerClient instances (pc-bw1, pc-bw2).
+//  3. Worker 2 opens a WatchCookies stream and consumes its initial snapshot.
+//  4. Worker 1 broadcasts a mock _abck cookie.
+//  5. Asserts Worker 2 receives the exact cookie payload within 50 milliseconds.
+//
+// Synchronisation is achieved with channels and a sync.WaitGroup; no
+// time.Sleep is used.
+func TestWatchCookies_BufconnBroadcast(t *testing.T) {
+	dialFn, stop := startBufconnServer(t)
+	t.Cleanup(stop)
+
+	worker1 := dialBufconn(t, dialFn)
+	worker2 := dialBufconn(t, dialFn)
+
+	// Worker 2 opens a WatchCookies stream with a generous parent deadline so
+	// the test is not flaky on a loaded CI machine.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+
+	stream, err := worker2.WatchCookies(ctx, &pb.WatchCookiesRequest{PcId: "pc-bw2"})
+	if err != nil {
+		t.Fatalf("WatchCookies: %v", err)
+	}
+
+	// Buffered channel drains the stream in a background goroutine.
+	// Size 8 is large enough that the goroutine never blocks in this test.
+	received := make(chan *pb.GetGlobalCookiesResponse, 8)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			msg, err := stream.Recv()
+			if err != nil {
+				return // context cancelled or stream closed
+			}
+			received <- msg
+		}
+	}()
+
+	// Wait for the initial snapshot (may be empty – just proves the stream is live).
+	// bufconn is in-memory so 200ms is ample even on a loaded CI machine.
+	select {
+	case <-received:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("timeout waiting for initial WatchCookies snapshot")
+	}
+
+	// Worker 1 broadcasts the _abck cookie.  The subscription is guaranteed to
+	// be active because we already received the initial snapshot, which is sent
+	// only after the subscriber is registered.
+	_, err = worker1.BroadcastCookie(ctx, &pb.BroadcastCookieRequest{
+		PcId:    "pc-bw1",
+		Cookies: []*pb.Cookie{{Name: "_abck", Value: "bufconn-sentinel", Domain: "example.com", Path: "/"}},
+	})
+	if err != nil {
+		t.Fatalf("BroadcastCookie: %v", err)
+	}
+
+	// Worker 2 must receive the pushed cookie within 50 ms.
+	// bufconn has zero network latency so this deadline is generous.
+	select {
+	case msg := <-received:
+		found := false
+		for _, ck := range msg.Cookies {
+			if ck.Name == "_abck" && ck.Value == "bufconn-sentinel" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("_abck=bufconn-sentinel not found in Worker 2's stream message: %v", msg.Cookies)
+		}
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("Worker 2 did not receive _abck cookie within 50ms")
+	}
+
+	cancel()  // terminate the stream
+	wg.Wait() // wait for the drainer goroutine to exit
 }
