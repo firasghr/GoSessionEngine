@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/firasghr/GoSessionEngine/config"
+	"github.com/firasghr/GoSessionEngine/dashboard"
 	"github.com/firasghr/GoSessionEngine/logger"
 	"github.com/firasghr/GoSessionEngine/metrics"
 	"github.com/firasghr/GoSessionEngine/proxy"
@@ -32,6 +33,7 @@ import (
 func main() {
 	// ── Flags ──────────────────────────────────────────────────────────────
 	configFile := flag.String("config", "", "Path to JSON config file (optional; uses defaults if omitted)")
+	dashboardAddr := flag.String("dashboard", ":8080", "Address for the real-time dashboard HTTP server (e.g. :8080)")
 	flag.Parse()
 
 	// ── Logger ─────────────────────────────────────────────────────────────
@@ -67,6 +69,15 @@ func main() {
 
 	// ── Metrics ────────────────────────────────────────────────────────────
 	m := metrics.NewMetrics()
+
+	// ── Dashboard server ───────────────────────────────────────────────────
+	dash := dashboard.New(m, cfg)
+	go func() {
+		if err := dash.ListenAndServe(*dashboardAddr); err != nil {
+			log.Errorf("dashboard server error: %v", err)
+		}
+	}()
+	log.Infof("dashboard server starting on %s", *dashboardAddr)
 
 	// ── Session manager ────────────────────────────────────────────────────
 	sm := session.NewSessionManager(cfg)
@@ -118,15 +129,17 @@ func main() {
 	log.Info("scheduler started; sessions are now active")
 
 	// ── Metrics monitor ────────────────────────────────────────────────────
-	// Print a summary line every 10 seconds.
+	// Print a summary line every 10 seconds and keep dashboard counters fresh.
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			total, success, failed := m.Snapshot()
 			rps := m.RequestsPerSecond()
+			count := sm.Count()
 			log.Infof("metrics – total: %d | success: %d | failed: %d | rps: %.1f | sessions: %d",
-				total, success, failed, rps, sm.Count())
+				total, success, failed, rps, count)
+			dash.SetActiveSessions(int64(count))
 		}
 	}()
 
@@ -136,6 +149,7 @@ func main() {
 	sig := <-sigCh
 	fmt.Println() // newline after ^C
 	log.Infof("received signal %s; shutting down", sig)
+	dash.AddLog("INFO", fmt.Sprintf("received signal %s; shutting down", sig))
 
 	// Stop dispatching new jobs.
 	sc.Stop()
