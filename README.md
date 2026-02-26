@@ -20,10 +20,15 @@ A high-performance, headless, concurrent HTTP session automation engine written 
 12. [Performance Characteristics](#performance-characteristics)
 13. [Fault Tolerance](#fault-tolerance)
 14. [Logging and Metrics](#logging-and-metrics)
-15. [Development Guide](#development-guide)
-16. [Production Deployment Guide](#production-deployment-guide)
-17. [Future Improvements](#future-improvements)
-18. [Conclusion](#conclusion)
+15. [TLS and HTTP/2 Fingerprinting](#tls-and-http2-fingerprinting)
+16. [JavaScript Challenge Solving](#javascript-challenge-solving)
+17. [Token and Session State Management](#token-and-session-state-management)
+18. [Payload Schema Validation](#payload-schema-validation)
+19. [Cluster Mode](#cluster-mode)
+20. [Development Guide](#development-guide)
+21. [Production Deployment Guide](#production-deployment-guide)
+22. [Future Improvements](#future-improvements)
+23. [Conclusion](#conclusion)
 
 ---
 
@@ -104,6 +109,30 @@ The `metrics` package tracks total requests dispatched, successful responses, an
 
 The `logger` package wraps the standard library `log.Logger` with a levelled interface supporting DEBUG, INFO, and ERROR levels. Level checks and writes are protected by a `sync.RWMutex` so that `SetLevel` can be called at runtime without data races. Log lines include microsecond-resolution timestamps, making latency diagnosis practical at high request rates.
 
+### TLS and HTTP/2 Fingerprint Bypass
+
+The `client` package includes a uTLS-backed TLS dialer (`tls_dialer.go`) and a Chrome-accurate HTTP/2 SETTINGS transport (`h2_transport.go`). Together they produce TLS ClientHello messages and HTTP/2 SETTINGS frames that are indistinguishable from a real Chrome 120 / 131 browser, bypassing JA3/JA4 fingerprint detection. An `OrderedHeader` type preserves exact header capitalisation and insertion order, which is also a fingerprinting signal for some server-side detection systems.
+
+### Browser Fingerprint Profiles
+
+The `fingerprint` package provides `Profile` types that bundle a TLS config, User-Agent string, and ordered default headers into a single, consistently-applied fingerprint. `ChromeProfile()` and `FirefoxProfile()` return pre-built profiles for Chrome 120 and Firefox 121 respectively. The `fingerprint` package also provides an Akamai `_abck` sensor payload generator (`sensor.go`) that produces randomised but statistically realistic telemetry payloads, including Bézier-curved mouse paths with sub-pixel jitter.
+
+### JavaScript Challenge Solving
+
+The `jschallenge` package provides a zero-browser JS challenge solver backed by the otto pure-Go JavaScript interpreter. `OttoSolver` exposes `Eval`, `GetCookie`, and `SetCookie` methods. A browser-stub environment (window, document, navigator) is pre-loaded so common challenge scripts execute without reference errors. For maximum throughput, create one solver per session.
+
+### Token and Session State Management
+
+The `token` package provides two components. `TokenRefreshManager` manages a single JWT per session, automatically refreshing it before expiry and sending periodic heartbeat requests to prevent server-side session expiry. `HeartbeatManager` extends this with a `sync.Map`-based per-session state store (`SessionState`) that allows thousands of goroutines to read shared authentication state without lock contention, plus a `ClaimSession` method for coordinating which worker processes a shared authenticated slot.
+
+### Payload Schema Validation
+
+The `payload` package provides adaptive API response validation. `Validator` learns the JSON schema of the first successful response and then compares every subsequent response against it, returning structured `Mismatch` records for missing fields, added fields, and type changes. This allows the engine to detect silent API contract changes before they cause corrupted downstream processing.
+
+### Cluster Mode
+
+The `cluster` package enables multi-node deployments. `MasterControllerServer` is a gRPC server that acts as the cluster-wide coordinator: it maintains a Global Cookie Jar, broadcasts freshly solved cookies to all worker nodes via server-streaming RPCs, and tracks session lifecycle state from every node. `WorkerClient` is the client-side façade that workers use to report status, upload cookies, and subscribe to real-time cookie updates. `InMemoryLock` provides a per-key distributed lock abstraction with context-aware blocking, a `TryLock` variant, and automatic map-entry pruning to keep memory bounded.
+
 ---
 
 ## Architecture Overview
@@ -141,6 +170,33 @@ Maintains three `uint64` atomic counters and a start timestamp. All increment an
 
 **logger.Logger**
 Levelled, thread-safe logger backed by three `log.Logger` instances (one per level). Level filtering is performed under a `sync.RWMutex` read-lock to allow concurrent log writes without blocking.
+
+**fingerprint.Profile**
+Bundles a `*tls.Config`, `UserAgent` string, and ordered extra headers into a single fingerprint profile. `ChromeProfile()` and `FirefoxProfile()` return browser-accurate profiles. `ApplyToTransport` and `ApplyHeaders` push the profile onto an `*http.Transport` and a session header map respectively.
+
+**fingerprint (sensor)**
+`GenerateSensorPayload` produces a randomised Akamai `_abck`-style telemetry payload with realistic screen metrics, navigator properties, timezone offset, Bézier-curved mouse path, and canvas hash. `NewSensorRequest` wraps the payload into a ready-to-send `*http.Request`.
+
+**jschallenge.OttoSolver**
+Wraps an `otto.Otto` JavaScript VM with a browser-stub global environment. `Eval` executes a challenge script and returns the result string. `GetCookie` / `SetCookie` bridge the JS `document.cookie` into the session's HTTP cookie jar. Protected by a `sync.Mutex`; one solver per session is recommended for maximum throughput.
+
+**token.TokenRefreshManager**
+Manages a single JWT per session under `sync.RWMutex`. Provides `ParseClaims`, `IsExpired`, `Refresh` (HTTP GET to refresh endpoint), `StartHeartbeat`, and `StartAutoRefresh`. All background goroutines are stopped by a single `Stop` call.
+
+**token.HeartbeatManager**
+Extends `TokenRefreshManager` with a `sync.Map`-keyed per-session `SessionState` store. `SetState` / `GetState` / `ClaimSession` give thousands of goroutines lock-free access to shared authentication state. A background goroutine sends periodic keep-alive requests and propagates `Set-Cookie` headers to all tracked sessions via `ExtractFromResponse`.
+
+**payload.Validator**
+Learns the JSON schema of the first API response and compares subsequent responses against it, returning typed `Mismatch` records (`MISSING_FIELD`, `ADDED_FIELD`, `TYPE_CHANGE`). Nested fields are addressed as dot-separated paths. Protected by `sync.RWMutex` for concurrent use.
+
+**cluster.MasterControllerServer**
+gRPC server that coordinates a multi-node cluster. Maintains a `GlobalCookieJar` (guarded by `sync.RWMutex`) and a `sync.Map` of session lifecycle states. Exposes `BroadcastCookie`, `UpdateStatus`, `GetGlobalCookies`, `WatchCookies` (server-streaming), and `GetAllStatus` RPCs. `ListenAndServe` starts the server and blocks until its context is cancelled.
+
+**cluster.WorkerClient**
+gRPC client façade for worker nodes. `ReportStatus`, `BroadcastCookie`, and `GetCookies` are one-shot calls. `WatchCookies` opens a background streaming goroutine that calls an `onUpdate` handler whenever the master pushes a fresh cookie snapshot.
+
+**cluster.InMemoryLock**
+Per-key `sync.Mutex` map implementing the `DistributedLock` interface. Supports context-aware blocking `Lock`, non-blocking `TryLock`, `Unlock`, and `IsLocked`. Reference counts on each `keyMutex` allow the map entry to be pruned when no goroutine is waiting, keeping memory bounded. Intended for single-node deployments or as a reference for production Redis/etcd-backed implementations.
 
 ### Component Interaction
 
@@ -368,7 +424,13 @@ GoSessionEngine/
 │   ├── manager.go           SessionManager: parallel creation, lookup, start/stop
 │   └── manager_test.go      Unit tests for session manager
 ├── client/
-│   └── client.go            HTTP client factory with tuned transport and cookie jar
+│   ├── client.go            HTTP client factory with tuned transport and cookie jar
+│   ├── tls_dialer.go        uTLS DialTLSContext dialer for JA3/JA4 fingerprint bypass
+│   ├── tls_dialer_test.go   Unit tests for the uTLS dialer
+│   ├── h2_transport.go      Chrome-accurate HTTP/2 SETTINGS transport wrapper
+│   ├── h2_transport_test.go Unit tests for the HTTP/2 transport
+│   ├── ordered_header.go    Header type that preserves capitalisation and insertion order
+│   └── ordered_header_test.go Unit tests for OrderedHeader
 ├── proxy/
 │   ├── proxy.go             Thread-safe round-robin proxy manager
 │   └── proxy_test.go        Unit tests for proxy loading and rotation
@@ -380,8 +442,34 @@ GoSessionEngine/
 ├── metrics/
 │   ├── metrics.go           Atomic request counters and throughput calculation
 │   └── metrics_test.go      Unit tests for counter operations and snapshot
-└── logger/
-    └── logger.go            Levelled, thread-safe logger backed by standard library
+├── logger/
+│   └── logger.go            Levelled, thread-safe logger backed by standard library
+├── fingerprint/
+│   ├── fingerprint.go       Browser fingerprint profiles (Chrome 120, Firefox 121)
+│   ├── fingerprint_test.go  Unit tests for profile application
+│   ├── sensor.go            Akamai _abck sensor payload generator with mouse-path synthesis
+│   └── sensor_test.go       Unit tests for sensor payload generation
+├── jschallenge/
+│   ├── solver.go            otto-backed JS challenge solver with browser-stub globals
+│   └── solver_test.go       Unit tests for Eval, GetCookie, and SetCookie
+├── token/
+│   ├── refresh.go           JWT TokenRefreshManager: parse, refresh, heartbeat, auto-refresh
+│   ├── refresh_test.go      Unit tests for token parsing, expiry, and refresh
+│   ├── heartbeat.go         HeartbeatManager: per-session sync.Map state, keep-alive loop
+│   └── heartbeat_test.go    Unit tests for state store, claim, and keep-alive
+├── payload/
+│   ├── validator.go         Adaptive JSON schema validator with mismatch diffing
+│   └── validator_test.go    Unit tests for Learn, Validate, and mismatch detection
+└── cluster/
+    ├── controller.go        MasterControllerServer: GlobalCookieJar, gRPC RPCs, ListenAndServe
+    ├── controller_test.go   Unit tests for broadcast, status, watch, and jar operations
+    ├── lock.go              InMemoryLock: per-key mutex map implementing DistributedLock
+    ├── lock_test.go         Unit tests for Lock, TryLock, Unlock, and WithLock
+    ├── worker_client.go     WorkerClient: gRPC client façade for worker nodes
+    └── pb/
+        ├── controller.proto     Protobuf service definition for MasterController
+        ├── controller.pb.go     Generated protobuf message types
+        └── controller_grpc.pb.go Generated gRPC service stubs
 ```
 
 ### File Responsibilities
@@ -399,7 +487,16 @@ Defines the `Session` struct and its three primary methods: `NewSession` (constr
 Defines `SessionManager` with a `map[int]*Session` protected by `sync.RWMutex`. `CreateSessions` parallelises construction using goroutines and a results channel. `StartAll` and `StopAll` batch-transition all sessions. `GetSession` and `Count` are read-optimised with `RLock`.
 
 **client/client.go**
-Implements `NewHTTPClient(proxy, timeout)`, the factory function for session HTTP clients. `buildTransport` constructs a `*http.Transport` with explicit pool limits and optional proxy. `newCookieJar` wraps `cookiejar.New` with error handling.
+Implements `NewHTTPClient(proxy, timeout)`, the factory function for session HTTP clients. `buildTransport` constructs a `*http.Transport` with explicit pool limits and optional proxy. `newCookieJar` wraps `cookiejar.New` with error handling. `NewHTTPClientWithTLS` is the uTLS-backed variant for fingerprint bypass.
+
+**client/tls_dialer.go**
+Provides `UTLSDialer` and `UTLSDialerHTTP1`, which return `DialTLSContext`-compatible functions that perform TLS handshakes using the uTLS library. The dialer applies the full `ClientHelloSpec` for the chosen `ClientHelloID` (e.g. `utls.HelloChrome_120`), producing GREASE values, cipher-suite ordering, and extensions that match a real browser.
+
+**client/h2_transport.go**
+`NewH2Transport` constructs an `*http.Transport` with Chrome 120-accurate HTTP/2 SETTINGS: `SETTINGS_HEADER_TABLE_SIZE` 65536, `SETTINGS_INITIAL_WINDOW_SIZE` 6291456, and the corresponding `WINDOW_UPDATE` frame. These values are required to pass HTTP/2 fingerprint checks on servers that profile SETTINGS frames.
+
+**client/ordered_header.go**
+`OrderedHeader` stores HTTP headers as an ordered `[]headerEntry` slice rather than a map, preserving both insertion order and exact capitalisation. `ApplyTo` writes the headers onto an `*http.Request` using direct field access to bypass Go's automatic header canonicalisation.
 
 **proxy/proxy.go**
 Implements `ProxyManager` with `LoadProxies` (file reader with comment and blank-line filtering), `GetNextProxy` (atomic round-robin under mutex), and `Count`.
@@ -415,6 +512,33 @@ Implements `Metrics` with `NewMetrics`, `IncrementTotal`, `IncrementSuccess`, `I
 
 **logger/logger.go**
 Implements `Logger` with `New(level)`, `SetLevel`, `Info`/`Infof`, `Error`/`Errorf`, and `Debug`/`Debugf`. Uses three `log.Logger` instances for level-specific prefixes and flags.
+
+**fingerprint/fingerprint.go**
+Defines `Profile` and `Header`. `ChromeProfile()` returns a Chrome 120-accurate profile with a matching TLS cipher suite order, User-Agent, and Sec-CH-UA headers. `FirefoxProfile()` returns a Firefox 121-accurate profile. `ApplyToTransport` clones the profile's `*tls.Config` onto a transport; `ApplyHeaders` writes User-Agent and extra headers into a session header map, skipping keys already set by the session.
+
+**fingerprint/sensor.go**
+`GenerateSensorPayload` creates a `SensorPayload` with randomised screen resolution, navigator properties, timezone offset, and a cubic Bézier mouse path with per-point timing jitter. `NewSensorRequest` marshals the payload and builds a `POST *http.Request` with the Akamai-expected content-type and origin headers.
+
+**jschallenge/solver.go**
+`NewOttoSolver(userAgent)` creates an `otto.Otto` VM seeded with `window`, `document`, and `navigator` globals. `Eval` acquires the VM mutex, runs the script, and returns the stringified result. `GetCookie` and `SetCookie` provide bridge access to `document.cookie` for challenge scripts that seed the cookie jar.
+
+**token/refresh.go**
+`TokenRefreshManager` manages one JWT under `sync.RWMutex`. `ParseClaims` base64url-decodes the JWT payload without signature verification. `IsExpired` checks the `exp` claim. `Refresh` GETs the refresh URL and calls `SetToken`. `StartHeartbeat` and `StartAutoRefresh` launch background goroutines driven by a shared `stopCh`.
+
+**token/heartbeat.go**
+`HeartbeatManager` wraps a `sync.Map` (keyed by session ID → `*SessionState`) with a background keep-alive loop. `ExtractFromResponse` merges `Set-Cookie` headers into the matching `SessionState` and marks it `Available`. `ClaimSession` uses `sync.Map.CompareAndSwap` to atomically take ownership of an available slot. `ApplyCookiesToRequest` injects stored cookies onto an outgoing request.
+
+**payload/validator.go**
+`Validator` wraps a `schema` (map of dot-separated field paths to JSON type names) behind a `sync.RWMutex`. `Learn` sets the baseline; `Validate` diffs the current response against it using `diffSchemas`, which returns sorted `Mismatch` slices for deterministic output. `FormatMismatches` converts the slice to a human-readable multi-line string.
+
+**cluster/controller.go**
+`GlobalCookieJar` is a version-tracked cookie store (`map[string]cookieEntry` + `atomic.Int64`). `MasterControllerServer` implements the `pb.MasterControllerServer` gRPC interface: `BroadcastCookie` stores cookies and fans them out to all active `WatchCookies` subscribers via buffered channels (dropping slow subscribers rather than blocking). `ListenAndServe` starts the gRPC server and stops it gracefully when the context is cancelled.
+
+**cluster/lock.go**
+`InMemoryLock` implements `DistributedLock` using a `map[string]*keyMutex` guarded by a top-level `sync.Mutex`. Each `keyMutex` pairs a `sync.Mutex` with a reference counter so the map entry is removed when no goroutine is waiting. `Lock` spawns a goroutine to allow context cancellation; `TryLock` uses the standard library `TryLock` call. `WithLock` is a convenience helper that acquires, runs a function, and releases.
+
+**cluster/worker_client.go**
+`WorkerClient` wraps `pb.MasterControllerClient`. `NewWorkerClient` dials the master with plain-text gRPC credentials (suitable for a trusted LAN). `BroadcastCookie` converts `[]*http.Cookie` to protobuf cookies before the RPC call. `WatchCookies` opens a streaming subscription in a background goroutine and calls `onUpdate` for every received snapshot.
 
 ---
 
@@ -714,6 +838,288 @@ For production deployments, the metrics monitor goroutine provides a baseline of
 
 ---
 
+## TLS and HTTP/2 Fingerprinting
+
+Advanced anti-bot systems correlate the TLS ClientHello (JA3/JA4), HTTP/2 SETTINGS frame, User-Agent, and header ordering to detect automation. GoSessionEngine addresses all four signals through the `client` and `fingerprint` packages.
+
+### uTLS Browser Impersonation
+
+`client.NewHTTPClientWithTLS(proxy, timeout, helloID)` constructs an `*http.Client` whose every outgoing TLS handshake is performed by the uTLS library rather than Go's standard `crypto/tls`. The `helloID` parameter selects the exact browser fingerprint to impersonate:
+
+| HelloID | Impersonates |
+|---|---|
+| `utls.HelloChrome_120` | Google Chrome 120 |
+| `utls.HelloChrome_131` | Google Chrome 131 |
+| `utls.HelloChrome_Auto` | Latest supported Chrome version |
+
+The dialer applies the full `ClientHelloSpec` for the chosen ID, including GREASE extension values, cipher suite ordering, and extension set. This produces a JA3/JA4 fingerprint that is indistinguishable from a real browser.
+
+### HTTP/2 SETTINGS Fingerprint
+
+`client.NewH2Transport(helloID)` constructs an `*http.Transport` pre-configured with Chrome 120-accurate HTTP/2 parameters:
+
+- `SETTINGS_HEADER_TABLE_SIZE`: 65 536 (Chrome raises the default from 4 096).
+- `SETTINGS_INITIAL_WINDOW_SIZE`: 6 291 456 (stream-level flow-control window).
+- `WINDOW_UPDATE` connection-level increment: 15 663 105.
+
+These exact values are captured from Wireshark traces of real Chrome 120 clients.
+
+### Header Order and Capitalisation
+
+`client.OrderedHeader` preserves both the insertion order and exact capitalisation of HTTP headers. Some detection systems flag requests where header names are canonicalised (e.g. `sec-ch-ua` is normalised to `Sec-Ch-Ua` by `http.Header`). `OrderedHeader.ApplyTo` writes headers directly into the request without capitalisation changes.
+
+### Applying a Fingerprint Profile
+
+The `fingerprint` package provides a higher-level `Profile` abstraction that bundles TLS, User-Agent, and extra headers:
+
+```go
+// Construct a session with a Chrome fingerprint
+p := fingerprint.ChromeProfile()
+p.ApplyToTransport(myTransport) // sets TLSClientConfig
+p.ApplyHeaders(mySession.Headers) // sets User-Agent + Sec-CH-UA headers
+```
+
+### Akamai Sensor Payload
+
+`fingerprint.GenerateSensorPayload(rng, seq)` produces a `SensorPayload` suitable for posting to an Akamai `_abck` sensor endpoint. The payload includes:
+
+- Randomised screen resolution and navigator properties drawn from realistic distributions.
+- A synthetic mouse path generated as a cubic Bézier curve with per-point timing jitter that mimics human deceleration near a click target.
+- A monotonically increasing sequence counter to prevent replay detection.
+
+```go
+payload := fingerprint.GenerateSensorPayload(nil, sessionSeq)
+req, err := fingerprint.NewSensorRequest("https://example.com/akam/11/pixel_abc", payload)
+// send req with session.Client.Do(req)
+```
+
+---
+
+## JavaScript Challenge Solving
+
+Some target services deliver lightweight JavaScript challenges that must be evaluated before the real request is accepted. The `jschallenge` package solves these challenges in-process without a headless browser.
+
+### OttoSolver
+
+`OttoSolver` wraps an `otto.Otto` JavaScript VM seeded with a minimal browser stub:
+
+```go
+solver, err := jschallenge.NewOttoSolver(fingerprint.ChromeProfile().UserAgent)
+if err != nil {
+    log.Fatal(err)
+}
+
+// Evaluate a challenge script
+result, err := solver.Eval(`(function(){ return 2 + 2; })()`)
+// result == "4"
+
+// Read any cookies set by the challenge
+cookieStr, err := solver.GetCookie()
+// Apply to the session's HTTP cookie jar
+```
+
+The stub pre-defines `window`, `document`, and `navigator.userAgent` so typical challenge scripts run without `ReferenceError`. The VM mutex serialises concurrent `Eval` calls; for maximum throughput at 2 000 sessions, create one `OttoSolver` per session.
+
+### Injecting Existing Cookies
+
+Some challenges require an existing `_abck` cookie to be present before evaluation. Use `SetCookie` to inject it before calling `Eval`:
+
+```go
+solver.SetCookie("_abck=existing_value")
+result, _ := solver.Eval(challengeScript)
+```
+
+---
+
+## Token and Session State Management
+
+### JWT Token Refresh
+
+`token.TokenRefreshManager` manages a single JWT for a session:
+
+```go
+mgr := token.NewTokenRefreshManager(
+    "https://example.com/api/refresh",
+    "https://example.com/api/heartbeat",
+    myHTTPClient,
+)
+mgr.SetToken(initialJWT)
+
+// Auto-refresh 60 s before the token expires, checking every 30 s
+mgr.StartAutoRefresh(30*time.Second, 60*time.Second)
+
+// Send keep-alive pings every 5 minutes
+mgr.StartHeartbeat(5*time.Minute, mgr.SendHeartbeat)
+
+// Use the token in a request
+req.Header.Set("Authorization", "Bearer "+mgr.GetToken())
+
+// Clean shutdown
+mgr.Stop()
+```
+
+`ParseClaims` decodes the JWT payload without signature verification (the engine trusts server-issued tokens). `IsExpired` checks the `exp` claim against the current wall-clock time.
+
+### Per-Session State with HeartbeatManager
+
+`token.HeartbeatManager` extends the token manager with a `sync.Map`-based state store for cluster deployments where many goroutines share authenticated session slots:
+
+```go
+hm := token.NewHeartbeatManager(
+    "https://example.com/api/heartbeat",
+    30*time.Second,
+    myHTTPClient,
+)
+
+// Store authentication state after solving a challenge
+hm.SetState(sessionID, &token.SessionState{
+    SessionID: sessionID,
+    Token:     jwt,
+    Cookies:   cookies,
+    Available: true,
+})
+
+// Find and claim a session slot (race-safe via CompareAndSwap)
+if st := hm.FindAvailable(); st != nil {
+    if hm.ClaimSession(st.SessionID) {
+        // this goroutine now owns the slot
+    }
+}
+
+// Apply session cookies to an outgoing request
+hm.ApplyCookiesToRequest(sessionID, req)
+```
+
+`ExtractFromResponse` automatically parses `Set-Cookie` headers from API responses and merges them into the appropriate `SessionState`, keeping credentials up to date without manual intervention.
+
+---
+
+## Payload Schema Validation
+
+The `payload.Validator` detects silent API contract changes that would otherwise corrupt downstream processing:
+
+```go
+v := payload.NewValidator()
+
+// First response: learn the baseline schema
+_ = v.Learn(firstResponseBody)
+
+// Subsequent responses: compare against the baseline
+mismatches, err := v.Validate(laterResponseBody)
+if err != nil {
+    log.Printf("validation error: %v", err)
+}
+if len(mismatches) > 0 {
+    log.Printf("API schema changed:\n%s", payload.FormatMismatches(mismatches))
+    // Alert your ops team before the change silently breaks processing
+}
+```
+
+`Mismatch` records are categorised as:
+
+| Kind | Description |
+|---|---|
+| `MISSING_FIELD` | A field present in the baseline is absent from the current response. |
+| `ADDED_FIELD` | A new field not in the baseline appeared in the current response. |
+| `TYPE_CHANGE` | A field exists in both but its JSON type changed (e.g. `number` → `string`). |
+
+Nested fields are addressed as dot-separated paths (e.g. `user.address.zip`). The mismatch list is sorted by field path for deterministic output suitable for diffing in logs.
+
+---
+
+## Cluster Mode
+
+For workloads exceeding a single machine's capacity, GoSessionEngine can run across multiple nodes in a gRPC master–worker topology.
+
+### Architecture
+
+```
++-------------------------------------+
+|        Master Node (PC #1)          |
+|  cluster.MasterControllerServer     |
+|  GlobalCookieJar (sync.RWMutex)     |
+|  Session state (sync.Map)           |
+|  WatchCookies subscribers           |
+|  gRPC :50051                        |
++-------------------------------------+
+           ↕ gRPC (LAN)
++-------------------------------------+     +-------------------------------------+
+|   Worker Node (PC #2)               |     |   Worker Node (PC #3 … #6)          |
+|   cluster.WorkerClient              |     |   cluster.WorkerClient              |
+|   ReportStatus / BroadcastCookie    |     |   WatchCookies goroutine            |
++-------------------------------------+     +-------------------------------------+
+```
+
+### Starting the Master
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+if err := cluster.ListenAndServe(ctx, ":50051"); err != nil {
+    log.Fatalf("master: %v", err)
+}
+```
+
+### Connecting a Worker
+
+```go
+wc, err := cluster.NewWorkerClient("pc-2", "master-host:50051")
+if err != nil {
+    log.Fatal(err)
+}
+defer wc.Close()
+
+// Report a session lifecycle transition
+wc.ReportStatus(ctx, int32(sessionID), "active")
+
+// After solving a JS challenge, broadcast the cookies to all nodes
+wc.BroadcastCookie(ctx, int32(sessionID), cookies)
+
+// Subscribe to real-time cookie updates
+wc.WatchCookies(ctx, func(cookies []*http.Cookie) {
+    // Apply cookies to all local sessions immediately
+    for _, s := range localSessions {
+        applyToJar(s, cookies)
+    }
+})
+```
+
+### Distributed Locking
+
+When multiple nodes compete for a shared resource (e.g. only one node should process the "applicant page" at a time), use `InMemoryLock` on the master or wire in a Redis/etcd-backed implementation:
+
+```go
+lock := cluster.NewInMemoryLock()
+
+// Blocking acquire with a 5-second timeout
+err := cluster.WithLock(ctx, lock, "applicant-page", 5*time.Second, func() {
+    // Only one goroutine executes this at a time
+    processApplicantPage(session)
+})
+if err != nil {
+    log.Printf("failed to acquire lock: %v", err)
+}
+```
+
+`TryLock` provides a non-blocking attempt for workloads that prefer to skip rather than wait:
+
+```go
+if lock.TryLock("applicant-page") {
+    defer lock.Unlock("applicant-page")
+    processApplicantPage(session)
+}
+```
+
+### Cookie Propagation Flow
+
+1. Worker PC #2 solves a JS challenge and calls `wc.BroadcastCookie(ctx, sessionID, cookies)`.
+2. The master's `BroadcastCookie` RPC stores the cookies in the `GlobalCookieJar` and immediately pushes them to every active `WatchCookies` subscriber.
+3. All other worker PCs (PC #3–#6) receive the cookies in their `WatchCookies` callback within one network round-trip.
+4. Each worker PC applies the cookies to its local sessions so they can start making authenticated requests without solving the challenge again.
+
+---
+
 ## Development Guide
 
 ### Extending the Job Function
@@ -901,9 +1307,9 @@ spec:
 
 ## Future Improvements
 
-**Distributed Cluster Support**
+**Distributed Cluster Enhancements**
 
-Implement a cluster coordination layer that allows multiple engine instances to share a session registry and distribute sessions across nodes. A lightweight consensus mechanism (etcd, Consul) or a pub/sub bus (NATS, Redis Streams) could synchronise session state, enabling session hand-off between nodes for rolling deployments without session loss.
+The current cluster implementation coordinates cookie distribution and session lifecycle state across nodes via gRPC. Future enhancements could include automatic master failover using a Raft-based consensus mechanism (etcd, Consul), inter-instance distributed rate limiting, and a centralised session registry with session hand-off support for rolling deployments without session loss.
 
 **Monitoring Dashboard**
 
@@ -924,10 +1330,6 @@ Replace the simple continuous loop scheduler with a priority-aware or rate-limit
 **Dynamic Session Scaling**
 
 Add a controller that monitors the error rate and request throughput and adjusts `NumberOfSessions` at runtime by calling `CreateSessions` or `StopAll` on a subset of sessions. This would allow the engine to scale session count in response to observed server capacity rather than requiring manual configuration changes.
-
-**TLS Client Fingerprint Rotation**
-
-Extend the HTTP client factory to randomise TLS fingerprints (cipher suites, extensions, curve preferences) across sessions, making the engine's traffic profile more closely resemble a diverse population of real clients. This is relevant for automation workloads where server-side fingerprinting is a concern.
 
 **Persistent Session State**
 
